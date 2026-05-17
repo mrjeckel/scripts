@@ -7,13 +7,15 @@
 
             author: Tillmen (tillmen@lichproject.org)
    original author: Shaelun
-      contributors: Deysh, Doug, Gildaren, Sarvatt, Tysong, Xanlin, Dissonance
+      contributors: Deysh, Doug, Gildaren, Sarvatt, Tysong, Xanlin, Dissonance, Yalathanil
               game: any
               tags: core, movement
            version: 2.2.13
           required: Lich >= 5.4.1
 
    changelog:
+      2.2.14 (2026-05-17)
+        Fix ;go2 confluence/instability logic
       2.2.13 (2025-11-22)
         Added support for ;go2 locker taking to public locker or CHE locker as applicable, if Lich version is 5.12.2 or later
         Added support for ;go2 guild or ;go2 guild shop to automatically look for the calling character's profession and go to the appropriate guild or guild shop.
@@ -1665,13 +1667,12 @@ module Go2
         #
         GameSettings['recent-instabilities'].delete_if { |i| i[:first_seen] < (Time.now.to_i - 21600) }
         GameSettings['recent-instabilities'].find_all { |i| i[:element] == CharSettings['element'] }.each { |i|
-          # fixme: would one full dijkstra be faster?
           if (path = Room.current.path_to(i[:room_id])) and (Map.estimate_time(path) <= 10.0)
             Script.run('go2', i[:room_id].to_s, :force => true)
             break if check_instability.call
           end
         }
-
+ 
         #
         # get room numbers from attune sense
         #
@@ -1681,63 +1682,81 @@ module Go2
           else
             set_desc = false
           end
-
+ 
+          # Read lines after a vision trigger, collecting desc and paths, skipping
+          # title/Lich-ID/loot lines. Returns [desc_text, paths_text].
+          collect_vision_text = lambda {
+            desc_text  = ''
+            paths_text = ''
+            loop do
+              line = get
+              if line =~ /^Obvious (?:paths|exits)/
+                paths_text = line
+                break
+              end
+              desc_text << ' ' << line unless line.strip.empty?
+            end
+            [desc_text.strip, paths_text]
+          }
+ 
+          # Match rooms by location + desc + paths; fall back to fuzzy desc regex.
+          find_rooms = lambda { |location, desc_text, paths_text|
+            ids = Room.list.find_all { |r|
+              r.location == location and r.desc.include?(desc_text) and r.paths.include?(paths_text)
+            }.collect { |r| r.id }
+            if ids.empty?
+              desc_regex = /#{Regexp.escape(desc_text).gsub(/\\\.(?:\\\.\\\.)?/, '|')}/
+              ids = Room.list.find_all { |r|
+                r.location == location and r.paths.include?(paths_text) and r.desc.any? { |d| d =~ desc_regex }
+              }.collect { |r| r.id }
+            end
+            ids
+          }
+ 
           2.times {
             put 'set description on' if set_desc
             sense_result = dothistimeout 'attune sense', 5, /^You sense nothing unusual\.|^You sense an unusual fluctuation emanating from .+\.|^You feel your senses being pulled towards a strong fluctuation\.\.\.|^You feel a strong sense of instability surround you!/
             put 'set description off' if set_desc
+ 
             if sense_result =~ /^You sense an unusual fluctuation emanating from (.+)\./
-              location = $1
-              bad_room_ids = Room.list.find_all { |iroom| iroom.location == location }.collect { |iroom| iroom.id }
+              location     = $1
+              bad_room_ids = Room.list.find_all { |r| r.location == location }.collect { |r| r.id }
+ 
             elsif sense_result =~ /^You feel your senses being pulled towards a strong fluctuation\.\.\./
-              location = Room.current.location
-              room_text = Array.new
-              3.times { room_text.push(get) }
-              good_room_ids = Room.list.find_all { |iroom| iroom.title.include?(room_text[0]) and iroom.desc.include?(room_text[1]) and iroom.paths.include?(room_text[2]) and iroom.location == location }.collect { |iroom| iroom.id }
-              if good_room_ids.empty?
-                desc_regex = /#{Regexp.escape(room_text[1]).gsub(/\\\.(?:\\\.\\\.)?/, '|')}/
-                good_room_ids = Room.list.find_all { |iroom| iroom.title.include?(room_text[0]) and iroom.paths.include?(room_text[2]) and iroom.location == location and iroom.desc.any? { |d| d =~ desc_regex } }.collect { |iroom| iroom.id }
-              end
+              location      = Room.current.location
+              desc_text, paths_text = collect_vision_text.call
+              good_room_ids = find_rooms.call(location, desc_text, paths_text)
               got_room_text = true
-              Room.list.find_all { |iroom| iroom.location == location }.each { |iroom| bad_room_ids.push(iroom.id) unless good_room_ids.include?(iroom.id) }
+              Room.list.find_all { |r| r.location == location }.each { |r| bad_room_ids.push(r.id) unless good_room_ids.include?(r.id) }
+ 
             elsif sense_result =~ /^You feel a strong sense of instability surround you!/
-              location = Room.current.location
+              location      = Room.current.location
               good_room_ids = [Room.current.id]
-              Room.list.find_all { |iroom| iroom.location == location }.each { |iroom| bad_room_ids.push(iroom.id) unless good_room_ids.include?(iroom.id) }
+              Room.list.find_all { |r| r.location == location }.each { |r| bad_room_ids.push(r.id) unless good_room_ids.include?(r.id) }
+ 
             elsif sense_result =~ /^You sense nothing unusual\./
               echo "error: can't get right"
               exit
+ 
             else
               echo "error: unrecognized result from \"attune sense\""
               exit
             end
-
+ 
+            # Drain any remaining buffered lines, picking up additional location hints.
+            # Note: the original "pulled towards" and "instability surround" cases here
+            # checked sense_result instead of line, so they could never fire — removed.
             while (line = get?)
               if line =~ /^You sense an unusual fluctuation emanating from (.+)\./
                 location = $1
-                Room.list.find_all { |iroom| iroom.location == location }.each { |iroom| bad_room_ids.push(iroom.id) unless bad_room_ids.include?(iroom.id) or good_room_ids.include?(iroom.id) }
-              elsif sense_result =~ /^You feel your senses being pulled towards a strong fluctuation\.\.\./
-                location = Room.current.location
-                room_text = Array.new
-                3.times { room_text.push(get) }
-                gri = Room.list.find_all { |iroom| iroom.title.include?(room_text[0]) and iroom.desc.include?(room_text[1]) and iroom.paths.include?(room_text[2]) and iroom.location == location }.collect { |iroom| iroom.id }
-                if gri.empty?
-                  desc_regex = /#{Regexp.escape(room_text[1]).gsub(/\\\.(?:\\\.\\\.)?/, '|')}/
-                  gri = Room.list.find_all { |iroom| iroom.title.include?(room_text[0]) and iroom.paths.include?(room_text[2]) and iroom.location == location and iroom.desc.any? { |d| d =~ desc_regex } }.collect { |iroom| iroom.id }
-                end
-                gri.each { |i| good_room_ids.push(i) unless good_room_ids.include?(i) }
-                got_room_text = true
-                Room.list.find_all { |iroom| iroom.location == location }.each { |iroom| bad_room_ids.push(iroom.id) unless bad_room_ids.include?(iroom.id) or good_room_ids.include?(iroom.id) }
-              elsif sense_result =~ /^You feel a strong sense of instability surround you!/
-                location = Room.current.location
-                good_room_ids.push(Room.current.id) unless good_room_ids.include?(Room.current.id)
-                Room.list.find_all { |iroom| iroom.location == location }.each { |iroom| bad_room_ids.push(iroom.id) unless bad_room_ids.include?(iroom.id) or good_room_ids.include?(iroom.id) }
+                Room.list.find_all { |r| r.location == location }.each { |r| bad_room_ids.push(r.id) unless bad_room_ids.include?(r.id) or good_room_ids.include?(r.id) }
               else
                 break
               end
             end
+ 
             waitrt?
-            break if got_room_text or (good_room_ids.count > 0)
+            break if got_room_text or good_room_ids.count > 0
             Script.run('go2', Room.current.find_nearest(bad_room_ids).to_s, :force => true)
           }
 
